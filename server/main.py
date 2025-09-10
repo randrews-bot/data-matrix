@@ -1,6 +1,4 @@
-# server/main.py
-import os, time, hmac, json, sqlite3
-from hashlib import sha256
+import os, time, sqlite3, asyncio
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,23 +12,21 @@ RENTCAST_API_KEY    = os.getenv("RENTCAST_API_KEY")
 STRIPE_SECRET_KEY   = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 ALLOWED_ORIGIN      = os.getenv("ALLOWED_ORIGIN", "https://superiorllc.org")
+DB_PATH             = os.getenv("PURCHASE_DB", "/tmp/purchases.db")
 
 if not (GOOGLE_MAPS_API_KEY and RENTCAST_API_KEY and STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET):
     raise RuntimeError("Missing required env vars: GOOGLE_MAPS_API_KEY, RENTCAST_API_KEY, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
-# Map product identification -> internal package code
-# You can match by product name, price, amount_total, or payment_link id.
+# Match by amount and/or description keywords (adjust to your Stripe products)
 PACKAGE_MATCHERS = {
     "snapshot": {"amount": 2900, "label_keywords": ["Snapshot"]},
     "investor": {"amount": 7900, "label_keywords": ["Investor"]},
     "consult":  {"amount": 19900, "label_keywords": ["Consultation", "Full"]},
 }
 
-DB_PATH = os.getenv("PURCHASE_DB", "/tmp/purchases.db")
-
-# ==== DB SETUP ====
+# ==== DB ====
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""CREATE TABLE IF NOT EXISTS purchases (
@@ -66,6 +62,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
 # ==== MODELS ====
 class FullReportReq(BaseModel):
     email: str
@@ -74,13 +74,7 @@ class FullReportReq(BaseModel):
     lat: float
     lng: float
 
-# ==== HELPERS ====
-async def get_json(client: httpx.AsyncClient, url: str, headers: Optional[dict] = None):
-    r = await client.get(url, headers=headers, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-# ==== GOOGLE ENDPOINTS (server-side key) ====
+# ==== GOOGLE (server-side key) ====
 @app.get("/api/geocode")
 async def geocode(address: str):
     async with httpx.AsyncClient() as client:
@@ -108,7 +102,7 @@ async def geocode(address: str):
             "lat": loc["lat"], "lng": loc["lng"],
             "city": city["long_name"] if city else None,
             "county": county["long_name"] if county else None,
-            "state": state or "VA"  # fallback
+            "state": state or "VA"
         }
 
 @app.get("/api/static-map")
@@ -152,31 +146,29 @@ async def rentcast_comps(lat: float, lng: float, radius: float = 1.0, limit: int
         r.raise_for_status()
         return r.json()
 
-# ==== STRIPE WEBHOOK (records purchases) ====
+# ==== STRIPE WEBHOOK ====
 @app.post("/api/stripe/webhook")
 async def stripe_webhook(request: Request):
     payload = await request.body()
     sig = request.headers.get("stripe-signature")
     try:
-        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig, secret=STRIPE_WEBHOOK_SECRET)
+        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig, secret=os.environ["STRIPE_WEBHOOK_SECRET"])
     except Exception as e:
         raise HTTPException(400, f"Webhook signature verification failed: {e}")
 
-    # We expect checkout.session.completed for Payment Links
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         email = (session.get("customer_details") or {}).get("email")
-        amount_total = session.get("amount_total")  # in cents
+        amount_total = session.get("amount_total")
         package = None
 
-        # Try to inspect line items (more reliable than amount)
+        # Try to match by line item description, fallback to amount
         try:
             line_items = stripe.checkout.Session.list_line_items(session["id"], limit=10)
-            labels = " ".join([ (li.get("description") or "") for li in line_items.data ])
+            labels = " ".join([(li.get("description") or "") for li in line_items.data])
         except Exception:
             labels = ""
 
-        # Match to a package
         for code, cfg in PACKAGE_MATCHERS.items():
             if amount_total == cfg["amount"]:
                 package = code
@@ -189,26 +181,34 @@ async def stripe_webhook(request: Request):
 
     return {"received": True}
 
-# ==== FULL REPORT (requires recorded purchase) ====
+# ==== FULL REPORT (requires purchase) ====
+class FullReportReq(BaseModel):
+    email: str
+    package: str
+    address: str
+    lat: float
+    lng: float
+
 @app.post("/api/full-report")
 async def full_report(req: FullReportReq):
-    # Validate purchase via recorded webhook
     if not has_recent_purchase(req.email, req.package, days=30):
         raise HTTPException(402, "Purchase not found yet")
 
     async with httpx.AsyncClient() as client:
-        # Fetch RentCast estimate + comps
         headers = {"X-Api-Key": RENTCAST_API_KEY}
         est_url = "https://api.rentcast.io/v1/rental-estimates"
         comps_url = "https://api.rentcast.io/v1/rental-comps"
 
-        est_task = client.get(est_url, params={"address": req.address}, headers=headers, timeout=20)
-        comps_task = client.get(comps_url, params={"latitude": req.lat, "longitude": req.lng, "radius": 1, "limit": 6}, headers=headers, timeout=20)
+        tasks = [
+            client.get(est_url, params={"address": req.address}, headers=headers, timeout=20),
+            client.get(comps_url, params={"latitude": req.lat, "longitude": req.lng, "radius": 1, "limit": 6}, headers=headers, timeout=20)
+        ]
+        est_res, comps_res = await asyncio.gather(*tasks)
 
-        est_res, comps_res = await httpx.AsyncClient.gather(est_task, comps_task)  # type: ignore
-
-        if est_res.status_code >= 400: raise HTTPException(500, "RentCast estimate failed")
-        if comps_res.status_code >= 400: raise HTTPException(500, "RentCast comps failed")
+        if est_res.status_code >= 400:
+            raise HTTPException(500, "RentCast estimate failed")
+        if comps_res.status_code >= 400:
+            raise HTTPException(500, "RentCast comps failed")
 
         estimate = est_res.json()
         comps = comps_res.json()
