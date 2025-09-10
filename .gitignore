@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.env
+.env.*
+
+# Node / web tooling (if used later)
+node_modules/
+dist/
+build/
+
+# OS
+.DS_Store
+
+# Data
+/data/
+purchases.db

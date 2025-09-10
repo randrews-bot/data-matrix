@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: superior-api
+    env: python
+    plan: starter
+    rootDir: .
+    region: oregon
+    buildCommand: pip install -r server/requirements.txt
+    startCommand: uvicorn server.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: RENTCAST_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: ALLOWED_ORIGIN
+        value: https://superiorllc.org
+      - key: PURCHASE_DB
+        value: /data/purchases.db
+    disk:
+      name: purchases
+      mountPath: /data
+      sizeGB: 1
